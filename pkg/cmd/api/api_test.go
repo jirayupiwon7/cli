@@ -13,11 +13,12 @@ import (
 	"time"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/export"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -576,8 +577,11 @@ func Test_apiRun_paginationREST(t *testing.T) {
 			return config.NewBlankConfig(), nil
 		},
 
-		RequestPath: "issues",
-		Paginate:    true,
+		RequestMethod:       "GET",
+		RequestMethodPassed: true,
+		RequestPath:         "issues",
+		Paginate:            true,
+		RawFields:           []string{"per_page=50", "page=1"},
 	}
 
 	err := apiRun(&options)
@@ -586,7 +590,7 @@ func Test_apiRun_paginationREST(t *testing.T) {
 	assert.Equal(t, `{"page":1}{"page":2}{"page":3}`, stdout.String(), "stdout")
 	assert.Equal(t, "", stderr.String(), "stderr")
 
-	assert.Equal(t, "https://api.github.com/issues?per_page=100", responses[0].Request.URL.String())
+	assert.Equal(t, "https://api.github.com/issues?page=1&per_page=50", responses[0].Request.URL.String())
 	assert.Equal(t, "https://api.github.com/repositories/1227/issues?page=2", responses[1].Request.URL.String())
 	assert.Equal(t, "https://api.github.com/repositories/1227/issues?page=3", responses[2].Request.URL.String())
 }
@@ -649,6 +653,101 @@ func Test_apiRun_paginationGraphQL(t *testing.T) {
 
 	assert.Contains(t, stdout.String(), `"page one"`)
 	assert.Contains(t, stdout.String(), `"page two"`)
+	assert.Equal(t, "", stderr.String(), "stderr")
+
+	var requestData struct {
+		Variables map[string]interface{}
+	}
+
+	bb, err := ioutil.ReadAll(responses[0].Request.Body)
+	require.NoError(t, err)
+	err = json.Unmarshal(bb, &requestData)
+	require.NoError(t, err)
+	_, hasCursor := requestData.Variables["endCursor"].(string)
+	assert.Equal(t, false, hasCursor)
+
+	bb, err = ioutil.ReadAll(responses[1].Request.Body)
+	require.NoError(t, err)
+	err = json.Unmarshal(bb, &requestData)
+	require.NoError(t, err)
+	endCursor, hasCursor := requestData.Variables["endCursor"].(string)
+	assert.Equal(t, true, hasCursor)
+	assert.Equal(t, "PAGE1_END", endCursor)
+}
+
+func Test_apiRun_paginated_template(t *testing.T) {
+	io, _, stdout, stderr := iostreams.Test()
+	io.SetStdoutTTY(true)
+
+	requestCount := 0
+	responses := []*http.Response{
+		{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{`application/json`}},
+			Body: ioutil.NopCloser(bytes.NewBufferString(`{
+				"data": {
+					"nodes": [
+						{
+							"page": 1,
+							"caption": "page one"
+						}
+					],
+					"pageInfo": {
+						"endCursor": "PAGE1_END",
+						"hasNextPage": true
+					}
+				}
+			}`)),
+		},
+		{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{`application/json`}},
+			Body: ioutil.NopCloser(bytes.NewBufferString(`{
+				"data": {
+					"nodes": [
+						{
+							"page": 20,
+							"caption": "page twenty"
+						}
+					],
+					"pageInfo": {
+						"endCursor": "PAGE20_END",
+						"hasNextPage": false
+					}
+				}
+			}`)),
+		},
+	}
+
+	options := ApiOptions{
+		IO: io,
+		HttpClient: func() (*http.Client, error) {
+			var tr roundTripper = func(req *http.Request) (*http.Response, error) {
+				resp := responses[requestCount]
+				resp.Request = req
+				requestCount++
+				return resp, nil
+			}
+			return &http.Client{Transport: tr}, nil
+		},
+		Config: func() (config.Config, error) {
+			return config.NewBlankConfig(), nil
+		},
+
+		RequestMethod: "POST",
+		RequestPath:   "graphql",
+		Paginate:      true,
+		// test that templates executed per page properly render a table.
+		Template: `{{range .data.nodes}}{{tablerow .page .caption}}{{end}}`,
+	}
+
+	err := apiRun(&options)
+	require.NoError(t, err)
+
+	assert.Equal(t, heredoc.Doc(`
+	1   page one
+	20  page twenty
+	`), stdout.String(), "stdout")
 	assert.Equal(t, "", stderr.String(), "stderr")
 
 	var requestData struct {
@@ -1167,10 +1266,15 @@ func Test_processResponse_template(t *testing.T) {
 		]`)),
 	}
 
-	_, err := processResponse(&resp, &ApiOptions{
+	opts := ApiOptions{
 		IO:       io,
 		Template: `{{range .}}{{.title}} ({{.labels | pluck "name" | join ", " }}){{"\n"}}{{end}}`,
-	}, ioutil.Discard)
+	}
+	template := export.NewTemplate(io, opts.Template)
+	_, err := processResponse(&resp, &opts, ioutil.Discard, &template)
+	require.NoError(t, err)
+
+	err = template.End()
 	require.NoError(t, err)
 
 	assert.Equal(t, heredoc.Doc(`
@@ -1179,4 +1283,86 @@ func Test_processResponse_template(t *testing.T) {
 		Alas, tis' the end (, feature)
 	`), stdout.String())
 	assert.Equal(t, "", stderr.String())
+}
+
+func Test_parseErrorResponse(t *testing.T) {
+	type args struct {
+		input      string
+		statusCode int
+	}
+	tests := []struct {
+		name       string
+		args       args
+		wantErrMsg string
+		wantErr    bool
+	}{
+		{
+			name: "no error",
+			args: args{
+				input:      `{}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "",
+			wantErr:    false,
+		},
+		{
+			name: "nil errors",
+			args: args{
+				input:      `{"errors":null}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "",
+			wantErr:    false,
+		},
+		{
+			name: "simple error",
+			args: args{
+				input:      `{"message": "OH NOES"}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "OH NOES (HTTP 500)",
+			wantErr:    false,
+		},
+		{
+			name: "errors string",
+			args: args{
+				input:      `{"message": "Conflict", "errors": "Some description"}`,
+				statusCode: 409,
+			},
+			wantErrMsg: "Some description (Conflict)",
+			wantErr:    false,
+		},
+		{
+			name: "errors array of strings",
+			args: args{
+				input:      `{"errors": ["fail1", "asplode2"]}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "fail1\nasplode2",
+			wantErr:    false,
+		},
+		{
+			name: "errors array of objects",
+			args: args{
+				input:      `{"errors": [{"message":"fail1"}, {"message":"asplode2"}]}`,
+				statusCode: 500,
+			},
+			wantErrMsg: "fail1\nasplode2",
+			wantErr:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1, err := parseErrorResponse(strings.NewReader(tt.args.input), tt.args.statusCode)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseErrorResponse() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if gotString, _ := ioutil.ReadAll(got); tt.args.input != string(gotString) {
+				t.Errorf("parseErrorResponse() got = %q, want %q", string(gotString), tt.args.input)
+			}
+			if got1 != tt.wantErrMsg {
+				t.Errorf("parseErrorResponse() got1 = %q, want %q", got1, tt.wantErrMsg)
+			}
+		})
+	}
 }
